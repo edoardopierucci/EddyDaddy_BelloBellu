@@ -41,6 +41,12 @@ utenti: dict[str, object] = {}  # id_utente -> connessione attiva
 
 # --- Database e password (libreria standard) --------------------------------
 def esegui(sql: str, params: tuple = ()):
+    """Esegue una query SQL sul database SQLite e restituisce la prima riga del risultato.
+
+    Serve a tutte le funzioni che parlano col database (creare la tabella, registrare un
+    utente, cercarlo al login). Apre e chiude la connessione a ogni chiamata, e il blocco
+    "with conn" fa il commit automatico se non ci sono errori.
+    """
     with closing(sqlite3.connect(DB_PATH)) as conn:
         with conn:  # commit automatico
             return conn.execute(sql, params).fetchone()
@@ -55,10 +61,20 @@ esegui(
 
 
 def calcola_hash(password: str, salt: bytes) -> bytes:
+    """Trasforma una password in un hash con l'algoritmo scrypt, usando il salt dato.
+
+    Serve a non salvare mai le password in chiaro nel database: si conserva solo l'hash.
+    scrypt è volutamente lento, per rendere costoso indovinare le password a tentativi.
+    """
     return hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
 
 
 def registra(nome: str, password: str):
+    """Crea un nuovo utente nel database con salt casuale e password cifrata.
+
+    Serve alla registrazione (comando R). Restituisce (nome, None) se va a buon fine,
+    oppure (None, "nickname già in uso") se esiste già un utente con quel nome.
+    """
     salt = os.urandom(16)
     try:
         esegui("INSERT INTO utenti VALUES (?, ?, ?)", (nome, salt, calcola_hash(password, salt)))
@@ -68,6 +84,12 @@ def registra(nome: str, password: str):
 
 
 def verifica(nome: str, password: str):
+    """Controlla che nome e password corrispondano a un utente registrato.
+
+    Serve al login (comando L). Restituisce (nome, None) se le credenziali sono giuste,
+    altrimenti (None, "credenziali"). Non dice se è sbagliato il nome o la password,
+    così nessuno può scoprire quali nickname esistono.
+    """
     riga = esegui("SELECT nome, salt, hash FROM utenti WHERE nome = ?", (nome,))
     # Hash calcolato anche se l'utente non esiste: stesso tempo di risposta.
     salt = riga[1] if riga else bytes(16)
@@ -80,32 +102,63 @@ def verifica(nome: str, password: str):
 
 # --- Protocollo -------------------------------------------------------------
 def adesso() -> str:
-    """Timestamp ISO 8601 con fuso orario, es. 2026-10-30T14:05:09+01:00"""
+    """Restituisce data e ora attuali in formato ISO 8601 con fuso orario.
+
+    Serve a mettere il timestamp ai messaggi (e al log sul terminale).
+    Esempio: 2026-10-30T14:05:09+01:00
+    """
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def pulisci(testo: str) -> str:
-    """Il '\\n' è il terminatore del messaggio: non può comparire nel corpo."""
+    """Toglie gli a capo dal testo e gli spazi ai bordi.
+
+    Serve perché il '\\n' è il terminatore del messaggio nel protocollo: se comparisse
+    nel corpo, il messaggio si spezzerebbe in due.
+    """
     return " ".join(testo.splitlines()).strip()
 
 
 async def rispondi(ws, tipo: str, testo: str):
+    """Invia a un solo client una riga nel formato "tipo|testo\\n".
+
+    Serve per le risposte private (es. esito del login, errori), che non devono
+    arrivare agli altri utenti.
+    """
     await ws.send(f"{tipo}|{testo}\n")
 
 
 def invia_messaggio(autore: str, corpo: str):
+    """Inoltra un messaggio di chat a tutti gli utenti online e lo stampa sul terminale.
+
+    Serve a far arrivare a tutti i messaggi scritti da qualcuno. L'autore e l'ora sono
+    quelli decisi dal server. La stampa sul terminale permette a chi gestisce il server
+    di vedere tutta la conversazione.
+    """
     riga = f"M|{autore}|{adesso()}|{corpo}\n"
+    print(f"[{adesso()}] {autore}: {corpo}", flush=True)
     broadcast(list(utenti.values()), riga)
 
 
 def invia_lista_utenti():
+    """Manda a tutti gli utenti online l'elenco aggiornato di chi è connesso.
+
+    Serve a tenere aggiornata la lista degli utenti nei client: va chiamata ogni volta
+    che qualcuno entra o esce.
+    """
     riga = "U|" + "|".join(sorted(utenti)) + "\n"
     broadcast(list(utenti.values()), riga)
 
 
 # --- Autenticazione ---------------------------------------------------------
 async def autentica(ws) -> str | None:
-    """Gestisce il primo scambio. Restituisce l'id_utente, o None se fallisce."""
+    """Gestisce il primo scambio con il client: login (L) o registrazione (R).
+
+    Serve a far entrare in chat solo utenti con credenziali valide. Controlla il formato
+    della richiesta, il nickname e la lunghezza della password, poi chiama verifica o
+    registra. Concede fino a MAX_TENTATIVI tentativi. Restituisce il nome dell'utente
+    se l'accesso riesce, oppure None (chiudendo la connessione) se i tentativi finiscono.
+    """
     for _ in range(MAX_TENTATIVI):
         grezzo = await asyncio.wait_for(ws.recv(), timeout=30)
 
@@ -137,12 +190,20 @@ async def autentica(ws) -> str | None:
 
 # --- Handler della connessione ----------------------------------------------
 async def chat(ws):
+    """Gestisce l'intera vita di una connessione: accesso, messaggi e uscita.
+
+    È la funzione chiamata dal server per ogni client che si collega. Prima autentica
+    l'utente, poi lo registra tra gli utenti online (stampando "Un utente si è connesso"
+    sul terminale), quindi resta in ascolto dei suoi messaggi e li inoltra a tutti.
+    Quando la connessione finisce, rimuove l'utente e aggiorna la lista per gli altri.
+    """
     nome = None
     try:
         nome = await autentica(ws)
         if nome is None:
             return
         await rispondi(ws, "C", "Login effettuato")
+        print(f"Un utente si è connesso: {nome}", flush=True)
 
         vecchia = utenti.get(nome)
         utenti[nome] = ws
@@ -168,11 +229,19 @@ async def chat(ws):
         # Rimuoviamo l'utente solo se la connessione registrata è ancora questa
         if nome and utenti.get(nome) is ws:
             del utenti[nome]
+            print(f"{nome} si è disconnesso", flush=True)
             invia_lista_utenti()
 
 
 # --- Pagina HTML servita sulla stessa porta ---------------------------------
 async def serve_pagina(connection, request):
+    """Decide come rispondere a ogni richiesta HTTP in arrivo sulla porta del server.
+
+    Serve a far convivere pagina web e WebSocket sulla stessa porta:
+    - "/ws" prosegue con l'handshake WebSocket (la chat vera e propria);
+    - "/" restituisce la pagina index.html;
+    - qualsiasi altro percorso risponde 404 "Non trovato".
+    """
     if request.path == "/ws":
         return None  # prosegue con l'handshake WebSocket
     if request.path == "/":
@@ -184,6 +253,12 @@ async def serve_pagina(connection, request):
 
 
 async def main():
+    """Avvia il server WebSocket e lo tiene acceso finché non lo fermi.
+
+    Serve da punto di partenza: mette il server in ascolto su HOST e PORT, collega
+    la funzione chat (per i client) e serve_pagina (per le richieste HTTP),
+    e limita la dimensione dei messaggi a 4096 byte.
+    """
     async with serve(chat, HOST, PORT, process_request=serve_pagina, max_size=4096) as server:
         print(f"Chat attiva su http://{HOST}:{PORT}")
         await server.serve_forever()
